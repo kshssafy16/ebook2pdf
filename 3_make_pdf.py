@@ -1,22 +1,42 @@
 """
 ebook_images_*.zip 파일을 PDF로 변환합니다.
 여러 ZIP이 있으면 각각 처리하고, 한 파일이 실패해도 다음 파일을 계속 처리합니다.
+
+Windows와 macOS에서 모두 동작합니다.
+macOS Safari처럼 ZIP을 자동으로 풀어버리는 경우를 위해
+ebook_images_*p 폴더도 함께 처리합니다.
 """
 
 from __future__ import annotations
 
+import platform
 import re
+import shutil
 import sys
 import tempfile
 import zipfile
 from pathlib import Path
 
+IS_MAC = platform.system() == "Darwin"
+INSTALL_SCRIPT = "2_install_img2pdf.command" if IS_MAC else "2_install_img2pdf.bat"
+
+
+def wait_for_enter() -> None:
+    """창이 바로 닫히지 않도록 대기합니다. 입력이 없는 환경에서는 건너뜁니다."""
+    if not sys.stdin or not sys.stdin.isatty():
+        return
+    try:
+        input("Enter를 누르면 종료합니다...")
+    except (EOFError, KeyboardInterrupt):
+        pass
+
+
 try:
     import img2pdf
 except ImportError:
     print("img2pdf가 설치되어 있지 않습니다.")
-    print("2_install_img2pdf.bat을 먼저 실행하세요.")
-    input("Enter를 누르면 종료합니다...")
+    print(f"{INSTALL_SCRIPT}을 먼저 실행하세요.")
+    wait_for_enter()
     raise SystemExit(1)
 
 ZIP_PATTERN = "ebook_images_*.zip"
@@ -26,6 +46,12 @@ IMAGE_PATTERN = re.compile(
 )
 ZIP_NAME_PATTERN = re.compile(
     r"^ebook_images_(\d+)p(?:\s*\((\d+)\))?\.zip$",
+    re.IGNORECASE,
+)
+# Safari가 ZIP을 자동으로 풀었을 때 생기는 폴더 이름 (예: ebook_images_113p, ebook_images_113p 2)
+FOLDER_PATTERN = "ebook_images_*"
+FOLDER_NAME_PATTERN = re.compile(
+    r"^ebook_images_(\d+)p(?:\s*\(?(\d+)\)?)?$",
     re.IGNORECASE,
 )
 
@@ -51,7 +77,14 @@ def find_zip_candidates() -> list[Path]:
     seen: set[Path] = set()
 
     for folder in candidate_folders():
-        for candidate in folder.glob(ZIP_PATTERN):
+        found = list(folder.glob(ZIP_PATTERN))
+        found += [
+            path
+            for path in folder.glob(FOLDER_PATTERN)
+            if path.is_dir() and FOLDER_NAME_PATTERN.fullmatch(path.name)
+        ]
+
+        for candidate in found:
             resolved = candidate.resolve()
             if resolved not in seen:
                 seen.add(resolved)
@@ -61,7 +94,8 @@ def find_zip_candidates() -> list[Path]:
 
 
 def zip_metadata(zip_path: Path) -> tuple[int | None, str]:
-    match = ZIP_NAME_PATTERN.fullmatch(zip_path.name)
+    pattern = FOLDER_NAME_PATTERN if zip_path.is_dir() else ZIP_NAME_PATTERN
+    match = pattern.fullmatch(zip_path.name)
 
     if not match:
         return None, "ebook.pdf"
@@ -101,6 +135,21 @@ def extract_images_from_zip(
     return extracted
 
 
+def collect_images_from_folder(folder: Path) -> list[tuple[int, Path]]:
+    collected: list[tuple[int, Path]] = []
+
+    for path in folder.rglob("*"):
+        if not path.is_file():
+            continue
+
+        match = IMAGE_PATTERN.fullmatch(path.name)
+        if match:
+            collected.append((int(match.group(1)), path))
+
+    collected.sort(key=lambda item: item[0])
+    return collected
+
+
 def validate_pages(
     images: list[tuple[int, Path]],
     declared_page_count: int | None,
@@ -138,16 +187,21 @@ def convert_zip(zip_path: Path) -> tuple[str, Path]:
         return "skip", output_path
 
     with tempfile.TemporaryDirectory(prefix="ebook2pdf_") as temp:
-        images = extract_images_from_zip(zip_path, Path(temp))
+        if zip_path.is_dir():
+            images = collect_images_from_folder(zip_path)
+        else:
+            images = extract_images_from_zip(zip_path, Path(temp))
         validate_pages(images, declared_page_count)
 
-        with output_path.open("wb") as output:
+        temp_output = Path(temp) / output_name
+        with temp_output.open("wb") as output:
             output.write(
                 img2pdf.convert(
                     [str(path) for _, path in images],
                     rotation=img2pdf.Rotation.ifvalid,
                 )
             )
+        shutil.move(str(temp_output), str(output_path))
 
     return "success", output_path
 
@@ -156,11 +210,11 @@ def main() -> int:
     zip_candidates = find_zip_candidates()
 
     if not zip_candidates:
-        print("ebook_images_*.zip 파일을 찾지 못했습니다.")
-        print("ZIP은 이 폴더 또는 Downloads 폴더에 두세요.")
+        print("ebook_images_*.zip 파일(또는 압축이 풀린 폴더)을 찾지 못했습니다.")
+        print("ZIP은 이 폴더 또는 Downloads(다운로드) 폴더에 두세요.")
         return 1
 
-    print(f"발견된 ZIP: {len(zip_candidates)}개")
+    print(f"발견된 ZIP/폴더: {len(zip_candidates)}개")
 
     successes: list[tuple[Path, Path]] = []
     skipped: list[tuple[Path, Path]] = []
@@ -206,5 +260,5 @@ if __name__ == "__main__":
         exit_code = 1
 
     print()
-    input("Enter를 누르면 종료합니다...")
+    wait_for_enter()
     sys.exit(exit_code)
